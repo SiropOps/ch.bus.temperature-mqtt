@@ -35,11 +35,18 @@ docker run -d \
   -e MQTT_BASE_TOPIC="van/temperature" \
   -e READ_INTERVAL_SECONDS="300" \
   -e SCAN_TIMEOUT_SECONDS="45" \
+  -e MISSED_CYCLES_BEFORE_OFFLINE="3" \
   ch.bus.temperature-mqtt/temperature:latest
 ```
 
 `--net=host`, `--privileged` et le montage DBus donnent au conteneur accès à
 l'adaptateur Bluetooth du Raspberry Pi.
+
+Le scanner BLE reste actif en continu. `SCAN_TIMEOUT_SECONDS` limite uniquement
+l'attente du premier relevé au démarrage ; les publications suivantes utilisent
+les annonces reçues pendant tout le cycle `READ_INTERVAL_SECONDS`. Un capteur ne
+passe hors ligne qu'après `MISSED_CYCLES_BEFORE_OFFLINE` cycles consécutifs sans
+annonce valide.
 
 ## Topics MQTT
 

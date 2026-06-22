@@ -10,7 +10,7 @@ une API HTTP.
 Capteurs BLE
     |
     v
-temperature (scan toutes les 5 minutes)
+temperature (écoute BLE continue, publication toutes les 5 minutes)
     |
     v
 Mosquitto MQTT  <----  api (FastAPI, port 8013)
@@ -105,11 +105,14 @@ docker run -d \
   -e MQTT_BASE_TOPIC="van/temperature" \
   -e READ_INTERVAL_SECONDS="300" \
   -e SCAN_TIMEOUT_SECONDS="45" \
+  -e MISSED_CYCLES_BEFORE_OFFLINE="3" \
   ch.bus.temperature-mqtt/temperature:latest
 ```
 
-Le début de chaque scan est espacé de 300 secondes. Le scan se termine plus tôt
-si les quatre capteurs ont déjà envoyé une trame valide.
+Le scanner BLE reste actif entre les publications afin de capter les sondes dont
+le signal est faible. Au démarrage, une première publication a lieu dès que les
+quatre capteurs ont répondu, ou après `SCAN_TIMEOUT_SECONDS`. Ensuite, les mesures
+les plus récentes sont publiées toutes les `READ_INTERVAL_SECONDS` secondes.
 
 ### Variables du collecteur
 
@@ -120,8 +123,9 @@ si les quatre capteurs ont déjà envoyé une trame valide.
 | `MQTT_USERNAME` | vide | Utilisateur MQTT |
 | `MQTT_PASSWORD` | vide | Mot de passe MQTT |
 | `MQTT_BASE_TOPIC` | `van/temperature` | Racine des topics |
-| `READ_INTERVAL_SECONDS` | `300` | Période entre deux scans |
-| `SCAN_TIMEOUT_SECONDS` | `45` | Durée maximale d'un scan BLE |
+| `READ_INTERVAL_SECONDS` | `300` | Période entre deux publications |
+| `SCAN_TIMEOUT_SECONDS` | `45` | Attente maximale du premier relevé au démarrage |
+| `MISSED_CYCLES_BEFORE_OFFLINE` | `3` | Cycles manqués avant de publier `offline` |
 
 ## 4. Lancer l'API
 

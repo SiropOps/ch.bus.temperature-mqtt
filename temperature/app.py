@@ -42,6 +42,7 @@ MQTT_BASE_TOPIC = env("MQTT_BASE_TOPIC", "van/temperature").rstrip("/")
 MQTT_STATUS_TOPIC = f"{MQTT_BASE_TOPIC}/status"
 READ_INTERVAL_SECONDS = int(env("READ_INTERVAL_SECONDS", "300"))
 SCAN_TIMEOUT_SECONDS = float(env("SCAN_TIMEOUT_SECONDS", "45"))
+MISSED_CYCLES_BEFORE_OFFLINE = int(env("MISSED_CYCLES_BEFORE_OFFLINE", "3"))
 
 THERMOBEACON_MANUFACTURER_IDS = {0x10, 0x11, 0x14, 0x15, 0x18, 0x1B, 0x30}
 PARSERS: dict[str, Callable[[AdvertisementData], dict[str, Any] | None]] = {}
@@ -208,56 +209,53 @@ def publish_sensor(
     print(message, flush=True)
 
 
-async def scan_once(client: mqtt.Client) -> None:
-    sensors_by_address = {sensor.address.upper(): sensor for sensor in SENSORS}
-    readings: dict[str, tuple[Sensor, dict[str, Any], int]] = {}
-    all_found = asyncio.Event()
-
-    def on_advertisement(
-        device: BLEDevice, advertisement: AdvertisementData
-    ) -> None:
-        address = device.address.upper()
-        sensor = sensors_by_address.get(address)
-        if sensor is None:
-            return
-        try:
-            values = PARSERS[sensor.protocol](advertisement)
-        except (IndexError, KeyError, struct.error, ValueError) as exc:
-            print(f"Invalid BLE data from {sensor.name}: {exc}", flush=True)
-            return
-        if values is None:
-            return
-        readings[address] = (sensor, values, advertisement.rssi)
-        if len(readings) == len(SENSORS):
-            all_found.set()
-
-    scanner = BleakScanner(detection_callback=on_advertisement)
-    await scanner.start()
-    try:
-        await asyncio.wait_for(all_found.wait(), timeout=SCAN_TIMEOUT_SECONDS)
-    except asyncio.TimeoutError:
-        pass
-    finally:
-        await scanner.stop()
-
+def publish_cycle(
+    client: mqtt.Client,
+    readings: dict[str, tuple[Sensor, dict[str, Any], int]],
+    missed_cycles: dict[str, int],
+) -> None:
     for sensor, values, rssi in readings.values():
         publish_sensor(client, sensor, values, rssi)
+        missed_cycles[sensor.address.upper()] = 0
 
     missing = [sensor for sensor in SENSORS if sensor.address.upper() not in readings]
     for sensor in missing:
-        print(f"WARNING: no valid BLE advertisement from {sensor.name} ({sensor.address})", flush=True)
-        client.publish(
-            f"{MQTT_BASE_TOPIC}/{topic_safe(sensor.name)}/availability",
-            "offline",
-            qos=1,
-            retain=True,
-        )
+        address = sensor.address.upper()
+        missed_cycles[address] += 1
+        misses = missed_cycles[address]
+        if misses >= MISSED_CYCLES_BEFORE_OFFLINE:
+            print(
+                f"WARNING: no valid BLE advertisement from {sensor.name} "
+                f"({sensor.address}) for {misses} consecutive cycles; marking offline",
+                flush=True,
+            )
+            client.publish(
+                f"{MQTT_BASE_TOPIC}/{topic_safe(sensor.name)}/availability",
+                "offline",
+                qos=1,
+                retain=True,
+            )
+        else:
+            print(
+                f"WARNING: no valid BLE advertisement from {sensor.name} "
+                f"({sensor.address}); missed cycle {misses}/"
+                f"{MISSED_CYCLES_BEFORE_OFFLINE}, keeping previous availability",
+                flush=True,
+            )
 
     summary = {
         "timestamp": utc_now(),
         "found": len(readings),
         "expected": len(SENSORS),
         "missing": [sensor.name for sensor in missing],
+        "offline": [
+            sensor.name
+            for sensor in missing
+            if missed_cycles[sensor.address.upper()] >= MISSED_CYCLES_BEFORE_OFFLINE
+        ],
+        "missed_cycles": {
+            sensor.name: missed_cycles[sensor.address.upper()] for sensor in SENSORS
+        },
     }
     client.publish(
         f"{MQTT_BASE_TOPIC}/scan",
@@ -286,24 +284,79 @@ def connect_mqtt(client: mqtt.Client) -> None:
 
 
 async def run(client: mqtt.Client) -> None:
-    while True:
-        cycle_started = time.monotonic()
+    sensors_by_address = {sensor.address.upper(): sensor for sensor in SENSORS}
+    readings: dict[str, tuple[Sensor, dict[str, Any], int]] = {}
+    missed_cycles = {address: 0 for address in sensors_by_address}
+    all_found = asyncio.Event()
+
+    def on_advertisement(
+        device: BLEDevice, advertisement: AdvertisementData
+    ) -> None:
+        address = device.address.upper()
+        sensor = sensors_by_address.get(address)
+        if sensor is None:
+            return
         try:
-            await scan_once(client)
-        except Exception as exc:
-            print(f"ERROR: BLE scan failed: {exc}", flush=True)
-        elapsed = time.monotonic() - cycle_started
-        await asyncio.sleep(max(0, READ_INTERVAL_SECONDS - elapsed))
+            values = PARSERS[sensor.protocol](advertisement)
+        except (IndexError, KeyError, struct.error, ValueError) as exc:
+            print(f"Invalid BLE data from {sensor.name}: {exc}", flush=True)
+            return
+        if values is None:
+            return
+        readings[address] = (sensor, values, advertisement.rssi)
+        if len(readings) == len(SENSORS):
+            all_found.set()
+
+    scanner = BleakScanner(detection_callback=on_advertisement)
+    cycle_started = time.monotonic()
+    next_publish = cycle_started + READ_INTERVAL_SECONDS
+    await scanner.start()
+    print("BLE scanner active continuously", flush=True)
+    try:
+        try:
+            await asyncio.wait_for(all_found.wait(), timeout=SCAN_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            pass
+
+        initial_readings = readings.copy()
+        readings.clear()
+        publish_cycle(client, initial_readings, missed_cycles)
+
+        while True:
+            await asyncio.sleep(max(0, next_publish - time.monotonic()))
+            cycle_readings = readings.copy()
+            readings.clear()
+            publish_cycle(client, cycle_readings, missed_cycles)
+            next_publish += READ_INTERVAL_SECONDS
+            if next_publish <= time.monotonic():
+                next_publish = time.monotonic() + READ_INTERVAL_SECONDS
+    finally:
+        await scanner.stop()
 
 
 def main() -> None:
-    if READ_INTERVAL_SECONDS <= 0 or SCAN_TIMEOUT_SECONDS <= 0:
-        raise ValueError("READ_INTERVAL_SECONDS and SCAN_TIMEOUT_SECONDS must be positive")
+    if (
+        READ_INTERVAL_SECONDS <= 0
+        or SCAN_TIMEOUT_SECONDS <= 0
+        or MISSED_CYCLES_BEFORE_OFFLINE <= 0
+    ):
+        raise ValueError(
+            "READ_INTERVAL_SECONDS, SCAN_TIMEOUT_SECONDS and "
+            "MISSED_CYCLES_BEFORE_OFFLINE must be positive"
+        )
 
     print("Starting temperature BLE -> MQTT bridge", flush=True)
     print(f"MQTT: {MQTT_HOST}:{MQTT_PORT}", flush=True)
     print(f"Topic base: {MQTT_BASE_TOPIC}", flush=True)
-    print(f"Cycle: {READ_INTERVAL_SECONDS}s; BLE scan: up to {SCAN_TIMEOUT_SECONDS}s", flush=True)
+    print(
+        f"Publication cycle: {READ_INTERVAL_SECONDS}s; "
+        f"initial BLE wait: up to {SCAN_TIMEOUT_SECONDS}s",
+        flush=True,
+    )
+    print(
+        f"Offline after {MISSED_CYCLES_BEFORE_OFFLINE} consecutive missed cycles",
+        flush=True,
+    )
     for sensor in SENSORS:
         print(f"Sensor: {sensor.name} ({sensor.address}, {sensor.protocol})", flush=True)
 
