@@ -3,8 +3,8 @@ FROM python:3.12-slim
 ENV PYTHONUNBUFFERED=1
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends bluetooth bluez \
-    && pip install --no-cache-dir bleak paho-mqtt \
+    && apt-get install -y --no-install-recommends bluetooth bluez libgpiod3 \
+    && pip install --no-cache-dir bleak paho-mqtt adafruit-circuitpython-dht \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 

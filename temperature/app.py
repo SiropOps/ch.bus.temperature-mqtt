@@ -12,6 +12,8 @@ from typing import Any, Callable
 from bleak import BleakScanner
 from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
+import adafruit_dht
+import board
 import paho.mqtt.client as mqtt
 
 
@@ -33,6 +35,7 @@ SENSORS = (
     Sensor("Fruit Storage", "49:22:11:08:18:64", "inkbird"),
     Sensor("Tête used", "49:22:09:05:14:A1", "inkbird"),
 )
+DHT22_SENSOR = Sensor("DHT22", "GPIO D4", "dht22")
 
 MQTT_HOST = env("MQTT_HOST", "127.0.0.1")
 MQTT_PORT = int(env("MQTT_PORT", "1883"))
@@ -43,6 +46,7 @@ MQTT_STATUS_TOPIC = f"{MQTT_BASE_TOPIC}/status"
 READ_INTERVAL_SECONDS = int(env("READ_INTERVAL_SECONDS", "300"))
 SCAN_TIMEOUT_SECONDS = float(env("SCAN_TIMEOUT_SECONDS", "45"))
 MISSED_CYCLES_BEFORE_OFFLINE = int(env("MISSED_CYCLES_BEFORE_OFFLINE", "3"))
+DHT22_TEMPERATURE_OFFSET = float(env("DHT22_TEMPERATURE_OFFSET", "-4"))
 
 THERMOBEACON_MANUFACTURER_IDS = {0x10, 0x11, 0x14, 0x15, 0x18, 0x1B, 0x30}
 PARSERS: dict[str, Callable[[AdvertisementData], dict[str, Any] | None]] = {}
@@ -187,7 +191,7 @@ def publish_sensor(
     client: mqtt.Client,
     sensor: Sensor,
     values: dict[str, Any],
-    rssi: int,
+    rssi: int | None = None,
 ) -> None:
     device_topic = f"{MQTT_BASE_TOPIC}/{topic_safe(sensor.name)}"
     enriched = {
@@ -195,9 +199,10 @@ def publish_sensor(
         "name": sensor.name,
         "address": sensor.address,
         "protocol": sensor.protocol,
-        "rssi": rssi,
         **values,
     }
+    if rssi is not None:
+        enriched["rssi"] = rssi
     message = json.dumps(enriched, ensure_ascii=False)
     client.publish(device_topic, message, qos=1, retain=True)
     client.publish(f"{device_topic}/availability", "online", qos=1, retain=True)
@@ -209,10 +214,33 @@ def publish_sensor(
     print(message, flush=True)
 
 
+def read_dht22(device: Any) -> dict[str, Any] | None:
+    try:
+        temperature = device.temperature
+        humidity = device.humidity
+        if temperature is None or humidity is None:
+            raise RuntimeError("incomplete DHT22 reading")
+
+        temperature += DHT22_TEMPERATURE_OFFSET
+        if not valid_environment(temperature, humidity):
+            raise RuntimeError(
+                f"invalid DHT22 reading: temperature={temperature}, humidity={humidity}"
+            )
+        return {
+            "model": "DHT22",
+            "temperature": round(temperature, 2),
+            "humidity": round(humidity, 2),
+        }
+    except RuntimeError as exc:
+        print(f"WARNING: DHT22 read failed: {exc}", flush=True)
+        return None
+
+
 def publish_cycle(
     client: mqtt.Client,
     readings: dict[str, tuple[Sensor, dict[str, Any], int]],
     missed_cycles: dict[str, int],
+    dht22_device: Any,
 ) -> None:
     for sensor, values, rssi in readings.values():
         publish_sensor(client, sensor, values, rssi)
@@ -243,10 +271,24 @@ def publish_cycle(
                 flush=True,
             )
 
+    dht22_values = read_dht22(dht22_device)
+    if dht22_values is not None:
+        publish_sensor(client, DHT22_SENSOR, dht22_values)
+        missed_cycles[DHT22_SENSOR.address] = 0
+    else:
+        missed_cycles[DHT22_SENSOR.address] += 1
+        if missed_cycles[DHT22_SENSOR.address] >= MISSED_CYCLES_BEFORE_OFFLINE:
+            client.publish(
+                f"{MQTT_BASE_TOPIC}/{topic_safe(DHT22_SENSOR.name)}/availability",
+                "offline",
+                qos=1,
+                retain=True,
+            )
+
     summary = {
         "timestamp": utc_now(),
-        "found": len(readings),
-        "expected": len(SENSORS),
+        "found": len(readings) + (1 if dht22_values is not None else 0),
+        "expected": len(SENSORS) + 1,
         "missing": [sensor.name for sensor in missing],
         "offline": [
             sensor.name
@@ -257,6 +299,11 @@ def publish_cycle(
             sensor.name: missed_cycles[sensor.address.upper()] for sensor in SENSORS
         },
     }
+    if dht22_values is None:
+        summary["missing"].append(DHT22_SENSOR.name)
+        if missed_cycles[DHT22_SENSOR.address] >= MISSED_CYCLES_BEFORE_OFFLINE:
+            summary["offline"].append(DHT22_SENSOR.name)
+    summary["missed_cycles"][DHT22_SENSOR.name] = missed_cycles[DHT22_SENSOR.address]
     client.publish(
         f"{MQTT_BASE_TOPIC}/scan",
         json.dumps(summary, ensure_ascii=False),
@@ -287,7 +334,9 @@ async def run(client: mqtt.Client) -> None:
     sensors_by_address = {sensor.address.upper(): sensor for sensor in SENSORS}
     readings: dict[str, tuple[Sensor, dict[str, Any], int]] = {}
     missed_cycles = {address: 0 for address in sensors_by_address}
+    missed_cycles[DHT22_SENSOR.address] = 0
     all_found = asyncio.Event()
+    dht22_device = adafruit_dht.DHT22(board.D4, use_pulseio=False)
 
     def on_advertisement(
         device: BLEDevice, advertisement: AdvertisementData
@@ -320,18 +369,19 @@ async def run(client: mqtt.Client) -> None:
 
         initial_readings = readings.copy()
         readings.clear()
-        publish_cycle(client, initial_readings, missed_cycles)
+        publish_cycle(client, initial_readings, missed_cycles, dht22_device)
 
         while True:
             await asyncio.sleep(max(0, next_publish - time.monotonic()))
             cycle_readings = readings.copy()
             readings.clear()
-            publish_cycle(client, cycle_readings, missed_cycles)
+            publish_cycle(client, cycle_readings, missed_cycles, dht22_device)
             next_publish += READ_INTERVAL_SECONDS
             if next_publish <= time.monotonic():
                 next_publish = time.monotonic() + READ_INTERVAL_SECONDS
     finally:
         await scanner.stop()
+        dht22_device.exit()
 
 
 def main() -> None:
@@ -345,7 +395,7 @@ def main() -> None:
             "MISSED_CYCLES_BEFORE_OFFLINE must be positive"
         )
 
-    print("Starting temperature BLE -> MQTT bridge", flush=True)
+    print("Starting temperature BLE/DHT22 -> MQTT bridge", flush=True)
     print(f"MQTT: {MQTT_HOST}:{MQTT_PORT}", flush=True)
     print(f"Topic base: {MQTT_BASE_TOPIC}", flush=True)
     print(
@@ -359,6 +409,11 @@ def main() -> None:
     )
     for sensor in SENSORS:
         print(f"Sensor: {sensor.name} ({sensor.address}, {sensor.protocol})", flush=True)
+    print(
+        f"Sensor: {DHT22_SENSOR.name} ({DHT22_SENSOR.address}, "
+        f"temperature offset {DHT22_TEMPERATURE_OFFSET:+g} C)",
+        flush=True,
+    )
 
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
     client.on_connect = on_connect

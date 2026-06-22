@@ -35,6 +35,7 @@ SENSORS = {
     "avalanche_toit": {"name": "Avalanche Toit", "address": "9D:88:00:00:02:2C"},
     "fruit_storage": {"name": "Fruit Storage", "address": "49:22:11:08:18:64"},
     "tete_used": {"name": "Tête used", "address": "49:22:09:05:14:A1"},
+    "dht22": {"name": "DHT22", "address": "GPIO D4"},
 }
 
 state_lock = threading.Lock()

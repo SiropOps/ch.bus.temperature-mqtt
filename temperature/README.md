@@ -1,7 +1,8 @@
-# Temperature BLE to MQTT
+# Temperature BLE/DHT22 to MQTT
 
 Ce conteneur écoute les annonces BLE des quatre capteurs configurés dans
-`app.py`, décode leurs mesures et les publie dans MQTT toutes les cinq minutes.
+`app.py`, lit un DHT22 sur D4 et publie leurs mesures dans MQTT toutes les cinq
+minutes.
 Il n'ouvre pas de connexion GATT permanente : Ruuvi, SensorBlue/ThermoBeacon et
 Inkbird diffusent leurs mesures directement, ce qui limite la consommation des
 piles.
@@ -14,6 +15,7 @@ piles.
 | Avalanche Toit | `9D:88:00:00:02:2C` | SensorBlue/ThermoBeacon |
 | Fruit Storage | `49:22:11:08:18:64` | Inkbird |
 | Tête used | `49:22:09:05:14:A1` | Inkbird |
+| DHT22 | `GPIO D4` | DHT22 filaire |
 
 ## Construction et lancement
 
@@ -36,6 +38,7 @@ docker run -d \
   -e READ_INTERVAL_SECONDS="300" \
   -e SCAN_TIMEOUT_SECONDS="45" \
   -e MISSED_CYCLES_BEFORE_OFFLINE="3" \
+  -e DHT22_TEMPERATURE_OFFSET="-4" \
   ch.bus.temperature-mqtt/temperature:latest
 ```
 
@@ -57,6 +60,7 @@ van/temperature/ca_pique
 van/temperature/avalanche_toit
 van/temperature/fruit_storage
 van/temperature/tete_used
+van/temperature/dht22
 ```
 
 Chaque valeur scalaire dispose aussi de son propre topic, par exemple :

@@ -1,16 +1,16 @@
 # ch.bus.temperature-mqtt
 
 Passerelle Docker pour relever des capteurs de température en Bluetooth Low
-Energy sur un Raspberry Pi, publier leurs mesures dans MQTT et les exposer avec
-une API HTTP.
+Energy et un DHT22 câblé sur D4 sur un Raspberry Pi, publier leurs mesures dans
+MQTT et les exposer avec une API HTTP.
 
 ## Architecture
 
 ```text
-Capteurs BLE
+Capteurs BLE + DHT22 sur D4
     |
     v
-temperature (écoute BLE continue, publication toutes les 5 minutes)
+temperature (écoute BLE, lecture DHT22, publication toutes les 5 minutes)
     |
     v
 Mosquitto MQTT  <----  api (FastAPI, port 8013)
@@ -29,6 +29,7 @@ connexion permanente avec les capteurs, ce qui économise leurs piles.
 | `avalanche_toit` | Avalanche Toit | `9D:88:00:00:02:2C` | SensorBlue/ThermoBeacon |
 | `fruit_storage` | Fruit Storage | `49:22:11:08:18:64` | Engbird Inkbird |
 | `tete_used` | Tête used | `49:22:09:05:14:A1` | Engbird Inkbird |
+| `dht22` | DHT22 | `GPIO D4` | DHT22 filaire |
 
 La configuration et les décodeurs se trouvent dans
 `temperature/app.py`.
@@ -44,6 +45,7 @@ docker/mosquitto/         broker MQTT et sa configuration
 ## Prérequis
 
 - Raspberry Pi avec Bluetooth activé ;
+- capteur DHT22 connecté à D4 (GPIO 4) ;
 - Docker et Docker Compose v2 ;
 - accès aux annonces BLE des quatre capteurs ;
 - ports `1883` (MQTT) et `8013` (API) disponibles.
@@ -106,6 +108,7 @@ docker run -d \
   -e READ_INTERVAL_SECONDS="300" \
   -e SCAN_TIMEOUT_SECONDS="45" \
   -e MISSED_CYCLES_BEFORE_OFFLINE="3" \
+  -e DHT22_TEMPERATURE_OFFSET="-4" \
   ch.bus.temperature-mqtt/temperature:latest
 ```
 
@@ -126,12 +129,13 @@ les plus récentes sont publiées toutes les `READ_INTERVAL_SECONDS` secondes.
 | `READ_INTERVAL_SECONDS` | `300` | Période entre deux publications |
 | `SCAN_TIMEOUT_SECONDS` | `45` | Attente maximale du premier relevé au démarrage |
 | `MISSED_CYCLES_BEFORE_OFFLINE` | `3` | Cycles manqués avant de publier `offline` |
+| `DHT22_TEMPERATURE_OFFSET` | `-4` | Correction en °C appliquée au DHT22, comme dans l'exemple fourni |
 
 ## 4. Lancer l'API
 
 L'API s'abonne par défaut à `van/temperature/+`. Elle ignore les topics de
 statut et conserve en mémoire le dernier paquet JSON complet de chacun des
-quatre capteurs.
+cinq capteurs.
 
 ```sh
 docker run -d \
@@ -169,6 +173,7 @@ van/temperature/ca_pique
 van/temperature/avalanche_toit
 van/temperature/fruit_storage
 van/temperature/tete_used
+van/temperature/dht22
 ```
 
 Exemple de paquet :
@@ -232,8 +237,8 @@ Exemple :
   "status": "ok",
   "mqtt_connected": true,
   "last_message_timestamp": "2026-06-22T20:15:01.000000+00:00",
-  "sensor_count": 4,
-  "expected_sensor_count": 4
+  "sensor_count": 5,
+  "expected_sensor_count": 5
 }
 ```
 
@@ -267,6 +272,7 @@ curl http://127.0.0.1:8013/api/sensors/ca_pique
 curl http://127.0.0.1:8013/api/sensors/avalanche_toit
 curl http://127.0.0.1:8013/api/sensors/fruit_storage
 curl http://127.0.0.1:8013/api/sensors/tete_used
+curl http://127.0.0.1:8013/api/sensors/dht22
 ```
 
 Un identifiant inconnu retourne `404`. Un capteur connu qui n'a encore envoyé
