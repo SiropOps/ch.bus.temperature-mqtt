@@ -46,6 +46,8 @@ MQTT_STATUS_TOPIC = f"{MQTT_BASE_TOPIC}/status"
 READ_INTERVAL_SECONDS = int(env("READ_INTERVAL_SECONDS", "300"))
 SCAN_TIMEOUT_SECONDS = float(env("SCAN_TIMEOUT_SECONDS", "45"))
 MISSED_CYCLES_BEFORE_OFFLINE = int(env("MISSED_CYCLES_BEFORE_OFFLINE", "3"))
+DHT22_READ_ATTEMPTS = 5
+DHT22_RETRY_DELAY_SECONDS = 2.0
 
 THERMOBEACON_MANUFACTURER_IDS = {0x10, 0x11, 0x14, 0x15, 0x18, 0x1B, 0x30}
 PARSERS: dict[str, Callable[[AdvertisementData], dict[str, Any] | None]] = {}
@@ -213,28 +215,42 @@ def publish_sensor(
     print(message, flush=True)
 
 
-def read_dht22(device: Any) -> dict[str, Any] | None:
-    try:
-        temperature = device.temperature
-        humidity = device.humidity
-        if temperature is None or humidity is None:
-            raise RuntimeError("incomplete DHT22 reading")
+async def read_dht22(device: Any) -> dict[str, Any] | None:
+    for attempt in range(1, DHT22_READ_ATTEMPTS + 1):
+        try:
+            temperature = device.temperature
+            humidity = device.humidity
+            if temperature is None or humidity is None:
+                raise RuntimeError("incomplete DHT22 reading")
 
-        if not valid_environment(temperature, humidity):
-            raise RuntimeError(
-                f"invalid DHT22 reading: temperature={temperature}, humidity={humidity}"
+            if not valid_environment(temperature, humidity):
+                raise RuntimeError(
+                    f"invalid DHT22 reading: temperature={temperature}, "
+                    f"humidity={humidity}"
+                )
+            return {
+                "model": "DHT22",
+                "temperature": round(temperature, 2),
+                "humidity": round(humidity, 2),
+            }
+        except RuntimeError as exc:
+            if attempt == DHT22_READ_ATTEMPTS:
+                print(
+                    f"WARNING: DHT22 read failed after {attempt} attempts: {exc}",
+                    flush=True,
+                )
+                return None
+            print(
+                f"WARNING: DHT22 read attempt {attempt}/{DHT22_READ_ATTEMPTS} "
+                f"failed: {exc}; retrying",
+                flush=True,
             )
-        return {
-            "model": "DHT22",
-            "temperature": round(temperature, 2),
-            "humidity": round(humidity, 2),
-        }
-    except RuntimeError as exc:
-        print(f"WARNING: DHT22 read failed: {exc}", flush=True)
-        return None
+            await asyncio.sleep(DHT22_RETRY_DELAY_SECONDS)
+
+    return None
 
 
-def publish_cycle(
+async def publish_cycle(
     client: mqtt.Client,
     readings: dict[str, tuple[Sensor, dict[str, Any], int]],
     missed_cycles: dict[str, int],
@@ -269,7 +285,7 @@ def publish_cycle(
                 flush=True,
             )
 
-    dht22_values = read_dht22(dht22_device)
+    dht22_values = await read_dht22(dht22_device)
     if dht22_values is not None:
         publish_sensor(client, DHT22_SENSOR, dht22_values)
         missed_cycles[DHT22_SENSOR.address] = 0
@@ -367,13 +383,13 @@ async def run(client: mqtt.Client) -> None:
 
         initial_readings = readings.copy()
         readings.clear()
-        publish_cycle(client, initial_readings, missed_cycles, dht22_device)
+        await publish_cycle(client, initial_readings, missed_cycles, dht22_device)
 
         while True:
             await asyncio.sleep(max(0, next_publish - time.monotonic()))
             cycle_readings = readings.copy()
             readings.clear()
-            publish_cycle(client, cycle_readings, missed_cycles, dht22_device)
+            await publish_cycle(client, cycle_readings, missed_cycles, dht22_device)
             next_publish += READ_INTERVAL_SECONDS
             if next_publish <= time.monotonic():
                 next_publish = time.monotonic() + READ_INTERVAL_SECONDS
