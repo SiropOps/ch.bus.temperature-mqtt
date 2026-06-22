@@ -38,7 +38,6 @@ docker run -d \
   -e READ_INTERVAL_SECONDS="300" \
   -e SCAN_TIMEOUT_SECONDS="45" \
   -e MISSED_CYCLES_BEFORE_OFFLINE="3" \
-  -e DHT22_TEMPERATURE_OFFSET="-4" \
   ch.bus.temperature-mqtt/temperature:latest
 ```
 

@@ -108,7 +108,6 @@ docker run -d \
   -e READ_INTERVAL_SECONDS="300" \
   -e SCAN_TIMEOUT_SECONDS="45" \
   -e MISSED_CYCLES_BEFORE_OFFLINE="3" \
-  -e DHT22_TEMPERATURE_OFFSET="-4" \
   ch.bus.temperature-mqtt/temperature:latest
 ```
 
@@ -129,7 +128,6 @@ les plus récentes sont publiées toutes les `READ_INTERVAL_SECONDS` secondes.
 | `READ_INTERVAL_SECONDS` | `300` | Période entre deux publications |
 | `SCAN_TIMEOUT_SECONDS` | `45` | Attente maximale du premier relevé au démarrage |
 | `MISSED_CYCLES_BEFORE_OFFLINE` | `3` | Cycles manqués avant de publier `offline` |
-| `DHT22_TEMPERATURE_OFFSET` | `-4` | Correction en °C appliquée au DHT22, comme dans l'exemple fourni |
 
 ## 4. Lancer l'API
 

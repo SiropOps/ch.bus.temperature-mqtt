@@ -46,7 +46,6 @@ MQTT_STATUS_TOPIC = f"{MQTT_BASE_TOPIC}/status"
 READ_INTERVAL_SECONDS = int(env("READ_INTERVAL_SECONDS", "300"))
 SCAN_TIMEOUT_SECONDS = float(env("SCAN_TIMEOUT_SECONDS", "45"))
 MISSED_CYCLES_BEFORE_OFFLINE = int(env("MISSED_CYCLES_BEFORE_OFFLINE", "3"))
-DHT22_TEMPERATURE_OFFSET = float(env("DHT22_TEMPERATURE_OFFSET", "-4"))
 
 THERMOBEACON_MANUFACTURER_IDS = {0x10, 0x11, 0x14, 0x15, 0x18, 0x1B, 0x30}
 PARSERS: dict[str, Callable[[AdvertisementData], dict[str, Any] | None]] = {}
@@ -221,7 +220,6 @@ def read_dht22(device: Any) -> dict[str, Any] | None:
         if temperature is None or humidity is None:
             raise RuntimeError("incomplete DHT22 reading")
 
-        temperature += DHT22_TEMPERATURE_OFFSET
         if not valid_environment(temperature, humidity):
             raise RuntimeError(
                 f"invalid DHT22 reading: temperature={temperature}, humidity={humidity}"
@@ -409,11 +407,7 @@ def main() -> None:
     )
     for sensor in SENSORS:
         print(f"Sensor: {sensor.name} ({sensor.address}, {sensor.protocol})", flush=True)
-    print(
-        f"Sensor: {DHT22_SENSOR.name} ({DHT22_SENSOR.address}, "
-        f"temperature offset {DHT22_TEMPERATURE_OFFSET:+g} C)",
-        flush=True,
-    )
+    print(f"Sensor: {DHT22_SENSOR.name} ({DHT22_SENSOR.address})", flush=True)
 
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
     client.on_connect = on_connect
