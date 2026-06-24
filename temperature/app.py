@@ -151,34 +151,42 @@ def parse_sensorblue(advertisement: AdvertisementData) -> dict[str, Any] | None:
 
 
 def parse_inkbird(advertisement: AdvertisementData) -> dict[str, Any] | None:
-    for manufacturer_id, payload in advertisement.manufacturer_data.items():
-        data = manufacturer_id.to_bytes(2, "little") + payload
-        if len(data) == 9:
-            temperature_raw, humidity_raw = struct.unpack("<hH", data[0:4])
-            temperature = temperature_raw / 100
-            humidity = humidity_raw / 100
-            battery = data[7]
-            model = "Inkbird IBS-TH/IBS-TH2"
-        elif len(data) == 18:
-            temperature_raw, humidity_raw = struct.unpack("<hH", data[6:10])
-            temperature = temperature_raw / 10
-            humidity = humidity_raw / 10
-            battery = data[10]
-            model = "Inkbird IBS-TH (18-byte)"
-        else:
-            continue
+    if not advertisement.manufacturer_data:
+        return None
 
-        if not valid_environment(temperature, humidity) or not 0 <= battery <= 100:
-            continue
-        values: dict[str, Any] = {
-            "model": model,
-            "temperature": round(temperature, 2),
-            "battery": battery,
-        }
-        if humidity_raw != 0:
-            values["humidity"] = round(humidity, 2)
-        return values
-    return None
+    # BlueZ/Bleak may accumulate manufacturer-data entries for an Inkbird.
+    # For 9-byte models the manufacturer ID itself contains the temperature,
+    # so iterating from the beginning keeps decoding the oldest observation.
+    # Dict insertion order makes the last entry the most recently received one.
+    manufacturer_id, payload = next(
+        reversed(advertisement.manufacturer_data.items())
+    )
+    data = manufacturer_id.to_bytes(2, "little") + payload
+    if len(data) == 9:
+        temperature_raw, humidity_raw = struct.unpack("<hH", data[0:4])
+        temperature = temperature_raw / 100
+        humidity = humidity_raw / 100
+        battery = data[7]
+        model = "Inkbird IBS-TH/IBS-TH2"
+    elif len(data) == 18:
+        temperature_raw, humidity_raw = struct.unpack("<hH", data[6:10])
+        temperature = temperature_raw / 10
+        humidity = humidity_raw / 10
+        battery = data[10]
+        model = "Inkbird IBS-TH (18-byte)"
+    else:
+        return None
+
+    if not valid_environment(temperature, humidity) or not 0 <= battery <= 100:
+        return None
+    values: dict[str, Any] = {
+        "model": model,
+        "temperature": round(temperature, 2),
+        "battery": battery,
+    }
+    if humidity_raw != 0:
+        values["humidity"] = round(humidity, 2)
+    return values
 
 
 PARSERS.update(
