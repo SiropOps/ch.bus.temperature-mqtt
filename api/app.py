@@ -40,6 +40,7 @@ SENSORS = {
 
 state_lock = threading.Lock()
 latest_sensors: dict[str, dict[str, Any]] = {}
+temperature_history: list[dict[str, Any]] = []
 last_message_timestamp: str | None = None
 mqtt_connected = False
 mqtt_client: mqtt.Client | None = None
@@ -47,6 +48,9 @@ mqtt_client: mqtt.Client | None = None
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+history_started_at = utc_now()
 
 
 def sensor_id_from_topic(topic: str) -> str | None:
@@ -129,6 +133,11 @@ def on_message(client: mqtt.Client, userdata: Any, message: mqtt.MQTTMessage) ->
 
     with state_lock:
         latest_sensors[sensor_id] = reading
+        # A retained packet is Mosquitto replaying the last known value after a
+        # reconnect. Keep it as the latest value, but do not count a stale
+        # reading from the previous session as part of the new trip.
+        if not message.retain:
+            temperature_history.append(reading)
         last_message_timestamp = received_at
     logger.info("Updated %s from %s", sensor_id, message.topic)
 
@@ -160,6 +169,22 @@ def sensors_response() -> dict[str, Any]:
         "expected_sensor_count": len(SENSORS),
         "missing_sensors": [sensor_id for sensor_id in SENSORS if sensor_id not in readings],
         "sensors": readings,
+    }
+
+
+def history_response(sensor_id: str | None = None) -> dict[str, Any]:
+    with state_lock:
+        readings = [
+            reading.copy()
+            for reading in temperature_history
+            if sensor_id is None or reading["sensor_id"] == sensor_id
+        ]
+
+    return {
+        "started_at": history_started_at,
+        "reading_count": len(readings),
+        "sensor_id": sensor_id,
+        "readings": readings,
     }
 
 
@@ -214,17 +239,39 @@ def get_sensor(sensor_id: str) -> JSONResponse:
     return JSONResponse(result)
 
 
+@app.get("/api/history")
+def get_history(sensor_id: str | None = None) -> JSONResponse:
+    if sensor_id is not None and sensor_id not in SENSORS:
+        return JSONResponse(
+            {"status": "unknown_sensor", "known_sensors": list(SENSORS)},
+            status_code=404,
+        )
+    return JSONResponse(history_response(sensor_id))
+
+
+@app.get("/api/history/{sensor_id}")
+def get_sensor_history(sensor_id: str) -> JSONResponse:
+    if sensor_id not in SENSORS:
+        return JSONResponse(
+            {"status": "unknown_sensor", "known_sensors": list(SENSORS)},
+            status_code=404,
+        )
+    return JSONResponse(history_response(sensor_id))
+
+
 @app.get("/api/health")
 def get_health() -> dict[str, Any]:
     with state_lock:
         connected = mqtt_connected
         updated_at = last_message_timestamp
         sensor_count = len(latest_sensors)
+        history_reading_count = len(temperature_history)
 
     return {
         "status": "ok" if connected else "degraded",
         "mqtt_connected": connected,
         "last_message_timestamp": updated_at,
         "sensor_count": sensor_count,
+        "history_reading_count": history_reading_count,
         "expected_sensor_count": len(SENSORS),
     }

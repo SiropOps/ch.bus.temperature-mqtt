@@ -132,8 +132,9 @@ les plus récentes sont publiées toutes les `READ_INTERVAL_SECONDS` secondes.
 ## 4. Lancer l'API
 
 L'API s'abonne par défaut à `van/temperature/+`. Elle ignore les topics de
-statut et conserve en mémoire le dernier paquet JSON complet de chacun des
-cinq capteurs.
+statut, conserve le dernier paquet JSON complet de chacun des cinq capteurs et
+ajoute chaque paquet reçu à l'historique du trajet. Cet historique reste en
+mémoire et repart donc vide à chaque redémarrage du conteneur API.
 
 ```sh
 docker run -d \
@@ -161,6 +162,8 @@ docker run -d \
 | `MQTT_TOPIC` | `van/temperature/+` | Filtre MQTT, surcharge facultative |
 | `API_PORT` | `8013` | Port HTTP |
 | `LOG_LEVEL` | `INFO` | Niveau des logs Python |
+
+Aucun volume ni service de base de données n'est nécessaire pour l'historique.
 
 ## Topics MQTT
 
@@ -275,6 +278,28 @@ curl http://127.0.0.1:8013/api/sensors/dht22
 
 Un identifiant inconnu retourne `404`. Un capteur connu qui n'a encore envoyé
 aucune mesure retourne `503`.
+
+### Historique du trajet
+
+```text
+GET /api/history
+GET /api/history?sensor_id=ca_pique
+GET /api/history/{sensor_id}
+```
+
+Chaque mesure MQTT valide est ajoutée dans l'ordre de réception. La réponse
+contient `started_at`, `reading_count` et la liste `readings`. Chaque élément
+reprend le paquet original, complété avec `sensor_id` et `received_at`.
+Les anciennes valeurs `retain` rejouées par Mosquitto au démarrage restent
+visibles dans `/api/sensors`, mais ne sont pas ajoutées au nouveau trajet.
+
+```sh
+curl http://127.0.0.1:8013/api/history
+curl http://127.0.0.1:8013/api/history/dht22
+```
+
+L'historique est volontairement éphémère : arrêter puis recréer ou redémarrer
+le conteneur `temperature-api` commence un nouveau trajet.
 
 La documentation OpenAPI interactive est disponible sur :
 
