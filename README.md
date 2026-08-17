@@ -108,6 +108,7 @@ docker run -d \
   -e READ_INTERVAL_SECONDS="300" \
   -e SCAN_TIMEOUT_SECONDS="45" \
   -e MISSED_CYCLES_BEFORE_OFFLINE="3" \
+  -e INKBIRD_GATT_TIMEOUT_SECONDS="20" \
   ch.bus.temperature-mqtt/temperature:latest
 ```
 
@@ -115,6 +116,8 @@ Le scanner BLE reste actif entre les publications afin de capter les sondes dont
 le signal est faible. Au démarrage, une première publication a lieu dès que les
 quatre capteurs ont répondu, ou après `SCAN_TIMEOUT_SECONDS`. Ensuite, les mesures
 les plus récentes sont publiées toutes les `READ_INTERVAL_SECONDS` secondes.
+Avant chaque publication, les deux Inkbird sont relues directement via GATT
+afin d'éviter les anciennes valeurs que BlueZ peut conserver dans les annonces.
 
 ### Variables du collecteur
 
@@ -128,6 +131,7 @@ les plus récentes sont publiées toutes les `READ_INTERVAL_SECONDS` secondes.
 | `READ_INTERVAL_SECONDS` | `300` | Période entre deux publications |
 | `SCAN_TIMEOUT_SECONDS` | `45` | Attente maximale du premier relevé au démarrage |
 | `MISSED_CYCLES_BEFORE_OFFLINE` | `3` | Cycles manqués avant de publier `offline` |
+| `INKBIRD_GATT_TIMEOUT_SECONDS` | `20` | Délai maximal de lecture directe d'une sonde Inkbird |
 
 ## 4. Lancer l'API
 

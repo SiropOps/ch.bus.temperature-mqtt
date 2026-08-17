@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-from bleak import BleakScanner
+from bleak import BleakClient, BleakScanner
 from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
 import adafruit_dht
@@ -48,6 +48,8 @@ SCAN_TIMEOUT_SECONDS = float(env("SCAN_TIMEOUT_SECONDS", "45"))
 MISSED_CYCLES_BEFORE_OFFLINE = int(env("MISSED_CYCLES_BEFORE_OFFLINE", "3"))
 DHT22_READ_ATTEMPTS = 5
 DHT22_RETRY_DELAY_SECONDS = 2.0
+INKBIRD_GATT_TIMEOUT_SECONDS = float(env("INKBIRD_GATT_TIMEOUT_SECONDS", "20"))
+INKBIRD_DATA_CHARACTERISTIC_UUID = "0000fff2-0000-1000-8000-00805f9b34fb"
 
 THERMOBEACON_MANUFACTURER_IDS = {0x10, 0x11, 0x14, 0x15, 0x18, 0x1B, 0x30}
 PARSERS: dict[str, Callable[[AdvertisementData], dict[str, Any] | None]] = {}
@@ -154,10 +156,9 @@ def parse_inkbird(advertisement: AdvertisementData) -> dict[str, Any] | None:
     if not advertisement.manufacturer_data:
         return None
 
-    # BlueZ/Bleak may accumulate manufacturer-data entries for an Inkbird.
-    # For 9-byte models the manufacturer ID itself contains the temperature,
-    # so iterating from the beginning keeps decoding the oldest observation.
-    # Dict insertion order makes the last entry the most recently received one.
+    # BlueZ may accumulate entries because 9-byte Inkbirds put the temperature
+    # in the manufacturer ID. This advertisement value is only provisional:
+    # publish_cycle refreshes these models directly over GATT before publishing.
     manufacturer_id, payload = next(
         reversed(advertisement.manufacturer_data.items())
     )
@@ -187,6 +188,38 @@ def parse_inkbird(advertisement: AdvertisementData) -> dict[str, Any] | None:
     if humidity_raw != 0:
         values["humidity"] = round(humidity, 2)
     return values
+
+
+def parse_inkbird_gatt(
+    data: bytes, advertisement_values: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Decode the current IBS-TH/IBS-TH2 value read from GATT FFF2."""
+    if len(data) < 4:
+        return None
+
+    temperature_raw, humidity_raw = struct.unpack("<hH", data[:4])
+    temperature = temperature_raw / 100
+    humidity = humidity_raw / 100
+    if not valid_environment(temperature, humidity):
+        return None
+
+    values = advertisement_values.copy()
+    values["model"] = "Inkbird IBS-TH/IBS-TH2"
+    values["temperature"] = round(temperature, 2)
+    if humidity_raw:
+        values["humidity"] = round(humidity, 2)
+    else:
+        values.pop("humidity", None)
+    return values
+
+
+async def read_inkbird_gatt(
+    device: BLEDevice, advertisement_values: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Read an authoritative current value instead of BlueZ's accumulated map."""
+    async with BleakClient(device, timeout=INKBIRD_GATT_TIMEOUT_SECONDS) as client:
+        data = bytes(await client.read_gatt_char(INKBIRD_DATA_CHARACTERISTIC_UUID))
+    return parse_inkbird_gatt(data, advertisement_values)
 
 
 PARSERS.update(
@@ -263,7 +296,39 @@ async def publish_cycle(
     readings: dict[str, tuple[Sensor, dict[str, Any], int]],
     missed_cycles: dict[str, int],
     dht22_device: Any,
+    ble_devices: dict[str, BLEDevice],
 ) -> None:
+    readings = readings.copy()
+    for address, (sensor, values, rssi) in list(readings.items()):
+        if sensor.protocol != "inkbird":
+            continue
+
+        device = ble_devices.get(address)
+        if device is None:
+            readings.pop(address)
+            continue
+
+        try:
+            current_values = await read_inkbird_gatt(device, values)
+        except Exception as exc:
+            print(
+                f"WARNING: direct Inkbird read failed for {sensor.name} "
+                f"({sensor.address}): {exc}",
+                flush=True,
+            )
+            readings.pop(address)
+            continue
+
+        if current_values is None:
+            print(
+                f"WARNING: invalid direct Inkbird data from {sensor.name} "
+                f"({sensor.address})",
+                flush=True,
+            )
+            readings.pop(address)
+            continue
+        readings[address] = (sensor, current_values, rssi)
+
     for sensor, values, rssi in readings.values():
         publish_sensor(client, sensor, values, rssi)
         missed_cycles[sensor.address.upper()] = 0
@@ -355,6 +420,7 @@ def connect_mqtt(client: mqtt.Client) -> None:
 async def run(client: mqtt.Client) -> None:
     sensors_by_address = {sensor.address.upper(): sensor for sensor in SENSORS}
     readings: dict[str, tuple[Sensor, dict[str, Any], int]] = {}
+    ble_devices: dict[str, BLEDevice] = {}
     missed_cycles = {address: 0 for address in sensors_by_address}
     missed_cycles[DHT22_SENSOR.address] = 0
     all_found = asyncio.Event()
@@ -367,6 +433,7 @@ async def run(client: mqtt.Client) -> None:
         sensor = sensors_by_address.get(address)
         if sensor is None:
             return
+        ble_devices[address] = device
         try:
             values = PARSERS[sensor.protocol](advertisement)
         except (IndexError, KeyError, struct.error, ValueError) as exc:
@@ -391,13 +458,17 @@ async def run(client: mqtt.Client) -> None:
 
         initial_readings = readings.copy()
         readings.clear()
-        await publish_cycle(client, initial_readings, missed_cycles, dht22_device)
+        await publish_cycle(
+            client, initial_readings, missed_cycles, dht22_device, ble_devices
+        )
 
         while True:
             await asyncio.sleep(max(0, next_publish - time.monotonic()))
             cycle_readings = readings.copy()
             readings.clear()
-            await publish_cycle(client, cycle_readings, missed_cycles, dht22_device)
+            await publish_cycle(
+                client, cycle_readings, missed_cycles, dht22_device, ble_devices
+            )
             next_publish += READ_INTERVAL_SECONDS
             if next_publish <= time.monotonic():
                 next_publish = time.monotonic() + READ_INTERVAL_SECONDS
@@ -411,10 +482,12 @@ def main() -> None:
         READ_INTERVAL_SECONDS <= 0
         or SCAN_TIMEOUT_SECONDS <= 0
         or MISSED_CYCLES_BEFORE_OFFLINE <= 0
+        or INKBIRD_GATT_TIMEOUT_SECONDS <= 0
     ):
         raise ValueError(
             "READ_INTERVAL_SECONDS, SCAN_TIMEOUT_SECONDS and "
-            "MISSED_CYCLES_BEFORE_OFFLINE must be positive"
+            "MISSED_CYCLES_BEFORE_OFFLINE and INKBIRD_GATT_TIMEOUT_SECONDS "
+            "must be positive"
         )
 
     print("Starting temperature BLE/DHT22 -> MQTT bridge", flush=True)

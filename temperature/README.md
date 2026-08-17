@@ -3,9 +3,10 @@
 Ce conteneur écoute les annonces BLE des quatre capteurs configurés dans
 `app.py`, lit un DHT22 sur D4 et publie leurs mesures dans MQTT toutes les cinq
 minutes.
-Il n'ouvre pas de connexion GATT permanente : Ruuvi, SensorBlue/ThermoBeacon et
-Inkbird diffusent leurs mesures directement, ce qui limite la consommation des
-piles.
+Il n'ouvre pas de connexion GATT permanente. Ruuvi et SensorBlue/ThermoBeacon
+sont lus depuis leurs annonces. Les Inkbird sont détectés par leurs annonces,
+puis relus brièvement via GATT avant chaque publication afin d'éviter les
+anciennes valeurs que BlueZ peut conserver.
 
 ## Capteurs
 
@@ -38,6 +39,7 @@ docker run -d \
   -e READ_INTERVAL_SECONDS="300" \
   -e SCAN_TIMEOUT_SECONDS="45" \
   -e MISSED_CYCLES_BEFORE_OFFLINE="3" \
+  -e INKBIRD_GATT_TIMEOUT_SECONDS="20" \
   ch.bus.temperature-mqtt/temperature:latest
 ```
 
@@ -48,7 +50,8 @@ Le scanner BLE reste actif en continu. `SCAN_TIMEOUT_SECONDS` limite uniquement
 l'attente du premier relevé au démarrage ; les publications suivantes utilisent
 les annonces reçues pendant tout le cycle `READ_INTERVAL_SECONDS`. Un capteur ne
 passe hors ligne qu'après `MISSED_CYCLES_BEFORE_OFFLINE` cycles consécutifs sans
-annonce valide.
+mesure valide. `INKBIRD_GATT_TIMEOUT_SECONDS` limite chaque lecture directe
+d'une sonde Inkbird.
 
 ## Topics MQTT
 
