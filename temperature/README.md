@@ -1,92 +1,47 @@
-# Temperature BLE/DHT22 to MQTT
+# Collecteur DHT22 vers MQTT
 
-Ce conteneur écoute les annonces BLE des quatre capteurs configurés dans
-`app.py`, lit un DHT22 sur D4 et publie leurs mesures dans MQTT toutes les cinq
-minutes.
-Il n'ouvre pas de connexion GATT permanente. Ruuvi et SensorBlue/ThermoBeacon
-sont lus depuis leurs annonces. Les Inkbird sont détectés par leurs annonces,
-puis relus brièvement via GATT avant chaque publication afin d'éviter les
-anciennes valeurs que BlueZ peut conserver.
-
-## Capteurs
-
-| Nom | Adresse | Protocole |
-| --- | --- | --- |
-| Ça pique | `E3:EE:E4:14:FA:B0` | Ruuvi |
-| Avalanche Toit | `9D:88:00:00:02:2C` | SensorBlue/ThermoBeacon |
-| Fruit Storage | `49:22:11:08:18:64` | Inkbird |
-| Tête used | `49:22:09:05:14:A1` | Inkbird |
-| DHT22 | `GPIO D4` | DHT22 filaire |
-
-## Construction et lancement
-
-Depuis la racine du dépôt :
+Ce conteneur ne lit que le DHT22 câblé sur D4 (GPIO 4). Toutes les sondes BLE
+Ruuvi, SensorBlue et Inkbird sont collectées par `ch.bus.bluetooth-mqtt`.
+Le chemin et le nom d'image `temperature/` sont conservés pour le déploiement.
 
 ```sh
 docker build -t ch.bus.temperature-mqtt/temperature:latest ./temperature
-
-docker run -d \
-  --restart=always \
-  --name temperature-mqtt \
-  --net=host \
-  --privileged \
-  -v /var/run/dbus:/var/run/dbus \
-  -e MQTT_HOST="127.0.0.1" \
-  -e MQTT_PORT="1883" \
-  -e MQTT_USERNAME="victron" \
-  -e MQTT_PASSWORD="CHANGE_ME" \
-  -e MQTT_BASE_TOPIC="van/temperature" \
-  -e READ_INTERVAL_SECONDS="300" \
-  -e SCAN_TIMEOUT_SECONDS="45" \
-  -e MISSED_CYCLES_BEFORE_OFFLINE="3" \
-  -e INKBIRD_GATT_TIMEOUT_SECONDS="20" \
+docker run -d --restart=always --name temperature-mqtt \
+  --net=host --device /dev/gpiomem:/dev/gpiomem \
+  --env-file mqtt.env --stop-timeout 15 \
   ch.bus.temperature-mqtt/temperature:latest
 ```
 
-`--net=host`, `--privileged` et le montage DBus donnent au conteneur accès à
-l'adaptateur Bluetooth du Raspberry Pi.
+`mqtt.env` contient uniquement `MQTT_HOST`, `MQTT_PORT`, `MQTT_USERNAME` et
+`MQTT_PASSWORD`. Aucun accès DBus, aucune dépendance BLE et aucun privilège
+Bluetooth ne sont nécessaires. Le périphérique GPIO précis dépend du Raspberry
+Pi et du backend GPIO ; cette commande conserve le backend RPi.GPIO existant,
+à vérifier sur le matériel cible.
 
-Le scanner BLE reste actif en continu. `SCAN_TIMEOUT_SECONDS` limite uniquement
-l'attente du premier relevé au démarrage ; les publications suivantes utilisent
-les annonces reçues pendant tout le cycle `READ_INTERVAL_SECONDS`. Un capteur ne
-passe hors ligne qu'après `MISSED_CYCLES_BEFORE_OFFLINE` cycles consécutifs sans
-mesure valide. `INKBIRD_GATT_TIMEOUT_SECONDS` limite chaque lecture directe
-d'une sonde Inkbird.
+| Variable | Défaut |
+| --- | --- |
+| `MQTT_HOST` / `MQTT_PORT` | `127.0.0.1` / `1883` |
+| `MQTT_USERNAME` / `MQTT_PASSWORD` | vide |
+| `MQTT_BASE_TOPIC` | `van/temperature` |
+| `READ_INTERVAL_SECONDS` | `300` |
+| `MISSED_CYCLES_BEFORE_OFFLINE` | `3` |
 
-## Topics MQTT
+Une lecture DHT22 peut être réessayée cinq fois, avec deux secondes entre essais.
+Les erreurs de mesure n'arrêtent pas le service. MQTT se reconnecte en arrière-plan.
+SIGTERM/SIGINT libèrent le capteur et ferment MQTT.
 
-Le JSON complet de chaque capteur est publié avec QoS 1 et `retain` :
-
-```text
-van/temperature/ca_pique
-van/temperature/avalanche_toit
-van/temperature/fruit_storage
-van/temperature/tete_used
-van/temperature/dht22
-```
-
-Chaque valeur scalaire dispose aussi de son propre topic, par exemple :
+Les topics de mesure restent `van/temperature/dht22` et ses champs scalaires,
+avec le même JSON, QoS 1 et `retain`. `van/temperature/dht22/availability`
+reste inchangé. Les diagnostics sont désormais réservés au GPIO :
 
 ```text
-van/temperature/fruit_storage/temperature
-van/temperature/fruit_storage/humidity
-van/temperature/fruit_storage/battery
-van/temperature/fruit_storage/rssi
+van/temperature/dht22/status   online / offline, retenu et Last Will
+van/temperature/dht22/scan     bilan JSON du cycle DHT22
 ```
 
-Topics de fonctionnement :
+`van/temperature/status` et `van/temperature/scan` appartiennent désormais à la
+passerelle Bluetooth. Cette séparation empêche les deux collecteurs de s'écraser
+mutuellement leurs statuts. L'API ne dépend pas de ces topics de diagnostic.
 
-```text
-van/temperature/status
-van/temperature/scan
-van/temperature/<capteur>/availability
-```
-
-`scan` contient le nombre de capteurs trouvés et la liste des absents lors du
-dernier cycle. Les valeurs `availability` sont `online` ou `offline`.
-
-Pour observer toutes les publications :
-
-```sh
-mosquitto_sub -h 127.0.0.1 -u victron -P 'CHANGE_ME' -t 'van/temperature/#' -v
-```
+Tests sans GPIO : installer `paho-mqtt` et `pytest`, puis exécuter
+`python -m pytest -q` dans ce répertoire.

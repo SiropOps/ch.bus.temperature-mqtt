@@ -1,6 +1,8 @@
 import json
 import logging
 import os
+import re
+import unicodedata
 import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -37,6 +39,31 @@ SENSORS = {
     "tete_used": {"name": "Tête used", "address": "49:22:09:05:14:A1"},
     "dht22": {"name": "DHT22", "address": "GPIO D4"},
 }
+
+
+
+def configured_sensors(defaults: dict) -> dict:
+    raw = os.environ.get("TEMPERATURE_SENSORS")
+    if raw is None:
+        return defaults
+    try:
+        rows = json.loads(raw)
+        if not isinstance(rows, list):
+            raise ValueError
+        result = {"dht22": defaults["dht22"]}
+        for row in rows:
+            name = row["name"]
+            identifier = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode()
+            identifier = re.sub(r"[^a-z0-9_-]+", "_", identifier.lower().strip()).strip("_") or "device"
+            if identifier in result or identifier in {"status", "scan"}:
+                raise ValueError
+            result[identifier] = {"name": name, "address": row["address"]}
+        return result
+    except (ValueError, TypeError, KeyError, AttributeError):
+        raise ValueError("Invalid TEMPERATURE_SENSORS configuration") from None
+
+
+SENSORS = configured_sensors(SENSORS)
 
 state_lock = threading.Lock()
 latest_sensors: dict[str, dict[str, Any]] = {}

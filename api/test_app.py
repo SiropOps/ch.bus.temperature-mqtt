@@ -1,5 +1,8 @@
 import json
 import unittest
+import os
+from unittest.mock import patch
+from fastapi.testclient import TestClient
 
 import app
 
@@ -64,6 +67,33 @@ class TemperatureHistoryTest(unittest.TestCase):
         self.assertEqual(app.latest_sensors["ca_pique"]["temperature"], 9.0)
         self.assertEqual(app.history_response()["reading_count"], 0)
 
+
+
+class TemperatureApiCompatibilityTest(unittest.TestCase):
+    def setUp(self):
+        app.latest_sensors.clear()
+        app.temperature_history.clear()
+        self.client = TestClient(app.app)
+
+    def test_gateway_and_gpio_readings_keep_routes_and_history(self):
+        for sensor_id in app.SENSORS:
+            app.on_message(None,None,FakeMessage(f"van/temperature/{sensor_id}",{"temperature":12.5,"humidity":42}))
+            self.assertEqual(self.client.get(f"/api/sensors/{sensor_id}").status_code,200)
+            self.assertEqual(self.client.get(f"/api/history/{sensor_id}").json()["reading_count"],1)
+        self.assertEqual(self.client.get("/api/metrics").json()["sensor_count"],5)
+        self.assertEqual(self.client.get("/api/sensors").json()["missing_sensors"],[])
+        self.assertEqual(self.client.get("/api/history").json()["reading_count"],5)
+        self.assertEqual(self.client.get("/api/sensors/unknown").status_code,404)
+
+    def test_waiting_response_stays_503(self):
+        self.assertEqual(self.client.get("/api/sensors").status_code,503)
+        self.assertEqual(self.client.get("/api/sensors/ca_pique").status_code,503)
+
+    def test_custom_gateway_sensor_config_is_supported_by_api(self):
+        with patch.dict(os.environ,{"TEMPERATURE_SENSORS": '[{"name":"Réserve","address":"AA:BB:CC:DD:EE:FF","protocol":"ruuvi"}]'}):
+            sensors = app.configured_sensors(app.SENSORS)
+        self.assertEqual(set(sensors),{"reserve","dht22"})
+        self.assertEqual(sensors["reserve"]["name"],"Réserve")
 
 if __name__ == "__main__":
     unittest.main()

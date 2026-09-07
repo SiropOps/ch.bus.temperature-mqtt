@@ -1,56 +1,60 @@
 # ch.bus.temperature-mqtt
 
-Passerelle Docker pour relever des capteurs de température en Bluetooth Low
-Energy et un DHT22 câblé sur D4 sur un Raspberry Pi, publier leurs mesures dans
-MQTT et les exposer avec une API HTTP.
-
-## Architecture
+API HTTP de température alimentée par MQTT, historique du trajet en mémoire et
+collecteur GPIO DHT22 pour Raspberry Pi. Toute acquisition Bluetooth est désormais
+assurée par `ch.bus.bluetooth-mqtt`.
 
 ```text
-Capteurs BLE + DHT22 sur D4
-    |
-    v
-temperature (écoute BLE, lecture DHT22, publication toutes les 5 minutes)
-    |
-    v
-Mosquitto MQTT  <----  api (FastAPI, port 8013)
-    |
-    +---- Home Assistant / Node-RED / Grafana / Inkplate
+Sondes BLE -> ch.bus.bluetooth-mqtt -> MQTT -> api/ (FastAPI)
+DHT22 GPIO -> temperature/ ---------> MQTT -> historique / consommateurs
 ```
 
-Le collecteur écoute passivement les annonces BLE. Il n'établit pas de
-connexion permanente avec les capteurs, ce qui économise leurs piles.
+Les routes, les identifiants et les payloads de mesure sont conservés. Le
+répertoire `temperature/` et son image restent disponibles, mais ils ne lisent
+plus que le DHT22. Aucun conteneur de ce dépôt n'accède à Bluetooth ou à DBus.
 
-## Capteurs configurés
+| Identifiant MQTT/API | Famille | Collecteur |
+| --- | --- | --- |
+| `ca_pique` | Ruuvi | bluetooth-mqtt |
+| `avalanche_toit` | SensorBlue/ThermoBeacon | bluetooth-mqtt |
+| `fruit_storage` | Inkbird GATT | bluetooth-mqtt |
+| `tete_used` | Inkbird GATT | bluetooth-mqtt |
+| `dht22` | GPIO D4 | temperature/ |
 
-| Identifiant MQTT/API | Nom | Adresse MAC | Famille |
-| --- | --- | --- | --- |
-| `ca_pique` | Ça pique | `E3:EE:E4:14:FA:B0` | Ruuvi |
-| `avalanche_toit` | Avalanche Toit | `9D:88:00:00:02:2C` | SensorBlue/ThermoBeacon |
-| `fruit_storage` | Fruit Storage | `49:22:11:08:18:64` | Engbird Inkbird |
-| `tete_used` | Tête used | `49:22:09:05:14:A1` | Engbird Inkbird |
-| `dht22` | DHT22 | `GPIO D4` | DHT22 filaire |
+La passerelle conserve les quatre adresses historiques comme valeurs par défaut.
+Pour remplacer cette liste, transmettre le même tableau JSON `TEMPERATURE_SENSORS`
+à la passerelle et à l'API : chaque entrée possède `name`, `address`, `protocol`
+et éventuellement `gatt`. L'API ajoute automatiquement le DHT22. Sans cette
+variable, ses cinq identifiants et ses réponses restent inchangés.
 
-La configuration et les décodeurs se trouvent dans
-`temperature/app.py`.
+La procédure de bascule est dans le dépôt voisin :
+[ch.bus.bluetooth-mqtt/MIGRATION.md](../ch.bus.bluetooth-mqtt/MIGRATION.md).
+Arrêter l'ancien collecteur BLE avant le démarrage de la passerelle centrale.
 
-## Contenu du projet
+## Construire et lancer le DHT22
 
-```text
-temperature/              collecteur BLE vers MQTT
-api/                      API HTTP abonnée aux mesures MQTT
-docker/mosquitto/         broker MQTT et sa configuration
+```sh
+docker build -t ch.bus.temperature-mqtt/temperature:latest ./temperature
+docker build -t ch.bus.temperature-mqtt/api:latest ./api
+
+docker run -d --restart=always --name temperature-mqtt \
+  --net=host --device /dev/gpiomem:/dev/gpiomem \
+  --stop-timeout 15 --env-file mqtt.env \
+  ch.bus.temperature-mqtt/temperature:latest
 ```
 
-## Prérequis
+Créer `mqtt.env` localement avec `MQTT_HOST`, `MQTT_PORT`, `MQTT_USERNAME` et
+`MQTT_PASSWORD`. Ne pas y copier les clés Victron. Le collecteur ne demande que
+l'accès GPIO correspondant au backend RPi.GPIO déjà utilisé. Consulter
+[temperature/README.md](temperature/README.md) pour ses paramètres et limites.
 
-- Raspberry Pi avec Bluetooth activé ;
-- capteur DHT22 connecté à D4 (GPIO 4) ;
-- Docker et Docker Compose v2 ;
-- accès aux annonces BLE des quatre capteurs ;
-- ports `1883` (MQTT) et `8013` (API) disponibles.
+Les diagnostics DHT22 passent à `van/temperature/dht22/status` et
+`van/temperature/dht22/scan`. Le topic de mesure `van/temperature/dht22` et tous
+ses champs restent identiques. `van/temperature/scan` conserve son schéma mais
+ne compte plus le DHT22 ; les consommateurs de supervision doivent distinguer
+les deux bilans. Les routes HTTP ne dépendent pas de ce changement.
 
-## 1. Préparer Mosquitto
+## Préparer Mosquitto
 
 Créer une fois le réseau utilisé par le fichier Compose :
 
@@ -79,61 +83,7 @@ docker compose -f docker/mosquitto/docker-compose.yml up -d
 Le broker écoute sur le port `1883` de l'hôte et refuse les connexions
 anonymes.
 
-## 2. Construire les images
-
-Depuis la racine du dépôt :
-
-```sh
-docker build -t ch.bus.temperature-mqtt/temperature:latest ./temperature
-docker build -t ch.bus.temperature-mqtt/api:latest ./api
-```
-
-## 3. Lancer le collecteur BLE
-
-Le mode réseau hôte, le mode privilégié et le montage DBus permettent au
-conteneur d'utiliser l'adaptateur Bluetooth du Raspberry Pi.
-
-```sh
-docker run -d \
-  --restart=always \
-  --name temperature-mqtt \
-  --net=host \
-  --privileged \
-  -v /var/run/dbus:/var/run/dbus \
-  -e MQTT_HOST="127.0.0.1" \
-  -e MQTT_PORT="1883" \
-  -e MQTT_USERNAME="victron" \
-  -e MQTT_PASSWORD="CHANGE_ME_MQTT_PASSWORD" \
-  -e MQTT_BASE_TOPIC="van/temperature" \
-  -e READ_INTERVAL_SECONDS="300" \
-  -e SCAN_TIMEOUT_SECONDS="45" \
-  -e MISSED_CYCLES_BEFORE_OFFLINE="3" \
-  -e INKBIRD_GATT_TIMEOUT_SECONDS="20" \
-  ch.bus.temperature-mqtt/temperature:latest
-```
-
-Le scanner BLE reste actif entre les publications afin de capter les sondes dont
-le signal est faible. Au démarrage, une première publication a lieu dès que les
-quatre capteurs ont répondu, ou après `SCAN_TIMEOUT_SECONDS`. Ensuite, les mesures
-les plus récentes sont publiées toutes les `READ_INTERVAL_SECONDS` secondes.
-Avant chaque publication, les deux Inkbird sont relues directement via GATT
-afin d'éviter les anciennes valeurs que BlueZ peut conserver dans les annonces.
-
-### Variables du collecteur
-
-| Variable | Défaut | Description |
-| --- | --- | --- |
-| `MQTT_HOST` | `127.0.0.1` | Adresse du broker |
-| `MQTT_PORT` | `1883` | Port du broker |
-| `MQTT_USERNAME` | vide | Utilisateur MQTT |
-| `MQTT_PASSWORD` | vide | Mot de passe MQTT |
-| `MQTT_BASE_TOPIC` | `van/temperature` | Racine des topics |
-| `READ_INTERVAL_SECONDS` | `300` | Période entre deux publications |
-| `SCAN_TIMEOUT_SECONDS` | `45` | Attente maximale du premier relevé au démarrage |
-| `MISSED_CYCLES_BEFORE_OFFLINE` | `3` | Cycles manqués avant de publier `offline` |
-| `INKBIRD_GATT_TIMEOUT_SECONDS` | `20` | Délai maximal de lecture directe d'une sonde Inkbird |
-
-## 4. Lancer l'API
+## Lancer l'API
 
 L'API s'abonne par défaut à `van/temperature/+`. Elle ignore les topics de
 statut, conserve le dernier paquet JSON complet de chacun des cinq capteurs et
@@ -210,9 +160,12 @@ Topics de supervision :
 
 | Topic | Contenu |
 | --- | --- |
-| `van/temperature/status` | `online` ou `offline` pour le collecteur |
-| `van/temperature/scan` | bilan JSON du dernier scan |
-| `van/temperature/<capteur>/availability` | présence au dernier scan |
+| `van/temperature/status` | alias de statut du collecteur BLE centralisé |
+| `van/temperature/scan` | bilan JSON des sondes BLE uniquement |
+| `van/temperature/<capteur>/availability` | disponibilité du capteur |
+| `van/bluetooth/status` | statut et Last Will de la passerelle BLE |
+| `van/temperature/dht22/status` | statut et Last Will DHT22 |
+| `van/temperature/dht22/scan` | bilan JSON du DHT22 |
 
 Observer toutes les publications :
 
@@ -311,34 +264,20 @@ La documentation OpenAPI interactive est disponible sur :
 http://<adresse-du-raspberry>:8013/docs
 ```
 
-## Vérification et dépannage
-
-Afficher les logs :
+## Vérification et tests
 
 ```sh
-docker logs -f van-mqtt
-docker logs -f temperature-mqtt
-docker logs -f temperature-api
+docker logs --tail 100 temperature-mqtt
+docker logs --tail 100 temperature-api
+python -m pip install -r requirements-test.txt
+python -m pytest -q temperature
+python -m pytest -q api
 ```
 
-Vérifier le Bluetooth sur l'hôte :
+Le matériel GPIO/Bluetooth n'est pas nécessaire aux tests. Les tests BLE sont
+maintenant dans `ch.bus.bluetooth-mqtt`. Les paquets retenus alimentent toujours
+la dernière valeur de l'API sans être ajoutés à l'historique du nouveau trajet.
 
-```sh
-bluetoothctl show
-bluetoothctl scan on
-```
-
-Si aucun capteur n'est trouvé :
-
-- vérifier que le Bluetooth est actif sur le Raspberry Pi ;
-- vérifier le montage `/var/run/dbus` et l'option `--privileged` ;
-- éloigner le Raspberry Pi des sources d'interférences USB 3/Wi-Fi ;
-- comparer les adresses détectées avec celles de `temperature/app.py` ;
-- augmenter temporairement `SCAN_TIMEOUT_SECONDS`.
-
-## Sécurité
-
-Ne pas enregistrer de vrais mots de passe dans Git. Le fichier
-`docker/mosquitto/config/passwords`, les fichiers `.env` et les secrets de
-déploiement doivent rester locaux. Pour un broker accessible depuis un autre
-réseau, ajouter TLS et limiter le port `1883` avec le pare-feu.
+Ne pas enregistrer de vrais mots de passe dans Git. Les fichiers `.env`, `*.env`
+et `docker/mosquitto/config/passwords` restent locaux. Ne pas démarrer un second
+broker si le Mosquitto existant est déjà partagé avec Victron et la passerelle.
